@@ -1,0 +1,36 @@
+# Secrets / config — never commit
+.env
+credentials.py
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+QubiqonPolicyAssistant.zip
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
