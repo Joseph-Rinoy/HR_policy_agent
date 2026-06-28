@@ -58,6 +58,8 @@ def stream_agent_answer(
     max_tokens: int = 400,
     enable_tools: bool = True,
     user: str | None = None,
+    tool_stats: dict | None = None,
+    systems: list[str] | None = None,
 ) -> Iterator[str]:
     """Stream an answer, calling read-only system tools when the query needs them.
 
@@ -66,6 +68,16 @@ def stream_agent_answer(
     plain (RAG-only) system prompt; ``agent_system_content`` is the tools-aware
     variant — it is used only when tools are actually offered this turn, so a
     pure-RAG turn looks exactly like the classic path.
+
+    ``tool_stats`` is an optional out-dict: if a tool is actually *called* this
+    turn (not merely offered), ``tool_stats["tools_used"]`` is set ``True``. The
+    UI uses this to drop the policy-only Source line / follow-up chips on a turn
+    answered from a system tool.
+
+    ``systems`` overrides routing when given (any list, including empty): the
+    caller has already decided which system(s) apply — e.g. a follow-up that
+    continues the previous tool turn. When ``None`` (the normal case) routing
+    decides from ``question`` as before.
     """
     adapter = get_adapter(provider, model)
     if not getattr(adapter, "is_ready", lambda: True)():
@@ -75,7 +87,8 @@ def stream_agent_answer(
     # Ollama models here aren't reliable tool-callers, so skip tools for them.
     tools = []
     if enable_tools and provider != "ollama" and gateway.is_available():
-        tools = gateway.list_tools(routing.route_systems(question), user=user)
+        chosen = systems if systems is not None else routing.route_systems(question)
+        tools = gateway.list_tools(chosen, user=user)
 
     chosen_system = agent_system_content if (tools and agent_system_content) else system_content
     messages: list[dict] = [{"role": "system", "content": chosen_system}]
@@ -92,6 +105,8 @@ def stream_agent_answer(
                 )
                 if not tool_calls:
                     break
+                if tool_stats is not None:
+                    tool_stats["tools_used"] = True
                 messages.append(adapter.assistant_tool_call_message(text, tool_calls))
                 for call in tool_calls:
                     result = gateway.call_tool(call.name, call.arguments, user=user)

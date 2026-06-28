@@ -66,6 +66,7 @@ from llm import (
 from paths import app_base_dir
 from policy_loader import PolicySection, load_contacts, load_policies
 from retriever import retrieve_scored
+import gateway
 
 
 LOGO_FILENAME = "Qubi.png"
@@ -167,6 +168,16 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y() + m.bottom()
 
 
+def _strip_source_line(text: str) -> str:
+    """Drop a trailing "Source: ..." line (and any trailing blank lines). The
+    Source line is policy-only; a system-tool answer should never carry one, so
+    we strip it deterministically rather than trusting the model to omit it."""
+    lines = text.rstrip().split("\n")
+    while lines and re.match(r"^\s*Source:", lines[-1], re.IGNORECASE):
+        lines.pop()
+    return "\n".join(lines).rstrip()
+
+
 def _markdown_to_html(text: str) -> str:
     """Minimal Markdown -> HTML so links can carry an inline color the
     widget stylesheet can't override. Handles links, bold, and line breaks."""
@@ -214,16 +225,32 @@ def _markdown_to_html(text: str) -> str:
 # Starter suggestions shown under the welcome: (chip label, question sent).
 # Labels carry a topic emoji for scannability; the question stays plain text so
 # the keyword retriever (retrieve_scored) isn't thrown off. Each maps to a real
-# policy: WFH=P5, Leave=P2, Working Hours=P1, Notice Period=P9, Travel=P16,
-# Dress Code=P6.
-_STARTER_CHIPS = [
-    ("🏠  Work from home", "How does the work-from-home policy work?"),
-    ("🌴  Leave & holidays", "How much leave do I get, and what types are there?"),
-    ("🕘  Working hours", "What are the standard working hours?"),
-    ("📅  Notice period", "What's the notice period when I resign?"),
-    ("✈️  Travel", "What does the travel policy cover?"),
-    ("👔  Dress code", "What's the dress code?"),
+# Selectable contexts. The user picks one (no AI routing); the mode decides which
+# system(s)' MCP tools are offered and whether the turn is RAG-grounded (Source
+# line + follow-up chips). Add an MCP app by adding an entry here — its `systems`
+# keys must already be registered in gateway/routing/mcp_client.
+_MODES = [
+    {
+        "key": "policy",
+        "label": "🏛  HR Policy",
+        "systems": [],
+        "rag": True,
+        "placeholder": "Ask about leave, WFH, conduct...",
+    },
+    {
+        "key": "finance",
+        "label": "💰  Finance",
+        "systems": ["finance"],
+        "rag": False,
+        "placeholder": "Ask about your expenses, advances, invoices...",
+        # Cheap read fired in the background when this mode is picked, to wake the
+        # (cold-starting) finance backend before the user's first real question.
+        "warm_tool": "finance.list_my_expenses",
+        "warm_args": {"page": 1, "pageSize": 1},
+    },
 ]
+_MODE_BY_KEY = {m["key"]: m for m in _MODES}
+_DEFAULT_MODE = "policy"
 
 # Generic fallback follow-ups when a policy has no sibling sub-topics to suggest.
 _FOLLOWUP_CHIPS = [
@@ -339,6 +366,7 @@ class LlmWorker(QThread):
         contacts: dict | None = None,
         max_tokens: int = 400,
         provider: str | None = None,
+        systems: list[str] | None = None,
     ):
         super().__init__()
         self.question = question
@@ -348,11 +376,17 @@ class LlmWorker(QThread):
         self.contacts = contacts
         self.max_tokens = max_tokens
         self.provider = provider
+        # Optional routing override (None ⇒ orchestrator routes from the question).
+        self.systems = systems
+        # Set True once the answer was produced via a system tool (not pure RAG),
+        # so the UI can drop the policy-only Source line / follow-up chips.
+        self.tools_used = False
 
     def run(self) -> None:
         try:
             # Agent path: HR policy RAG plus live Finance tools over MCP. Falls
             # back to plain RAG when Entra sign-in / the MCP server aren't set up.
+            tool_stats: dict = {}
             for chunk in stream_agent_answer(
                 self.question,
                 self.sections,
@@ -361,11 +395,35 @@ class LlmWorker(QThread):
                 self.contacts,
                 self.max_tokens,
                 self.provider,
+                tool_stats=tool_stats,
+                systems=self.systems,
             ):
                 self.chunk_received.emit(chunk)
+            self.tools_used = bool(tool_stats.get("tools_used"))
             self.finished_ok.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class _WarmupWorker(QThread):
+    """Wakes a system's MCP backend in the background (cold-start mitigation).
+
+    Fires one cheap read when an app mode is selected so the user's first real
+    question hits a warm server instead of the cold-start error. The result is
+    discarded and all errors are swallowed — this is best-effort warming only.
+    """
+
+    def __init__(self, tool: str, args: dict, user: str | None = None):
+        super().__init__()
+        self.tool = tool
+        self.args = args
+        self.user = user
+
+    def run(self) -> None:
+        try:
+            gateway.call_tool(self.tool, self.args, user=self.user)
+        except Exception:
+            pass  # warming is best-effort; the real query will retry if needed
 
 
 class LeaveWorker(QThread):
@@ -678,11 +736,19 @@ class ChatWidget(QWidget):
         # Sections from the last real policy question, reused for vague
         # follow-ups ("make it short") so they stay on the same topic.
         self._last_sections: list[PolicySection] = []
+        # The user-selected context (see `_MODES`). Drives routing deterministically:
+        # HR Policy = pure RAG (Source + chips); an app mode = its MCP tools only.
+        # `_pending_is_app_mode` records this turn's kind for `_on_done`.
+        self._mode = _DEFAULT_MODE
+        self._pending_is_app_mode = False
+        # The welcome mode chooser (shown until a mode is picked); see `_show_welcome`.
+        self._mode_chooser: QWidget | None = None
         # Clickable suggestion "chips" (starter prompts + post-answer follow-ups);
         # tracked so we can remove the stale row when a new message is sent.
         self._starter_chips: QWidget | None = None
         self._followup_chips: QWidget | None = None
         self._leave_worker: LeaveWorker | None = None
+        self._warmup_worker: _WarmupWorker | None = None
         self._active_card: ConfirmationCard | None = None
         self._pending_leave_bubble: MessageBubble | None = None
         self._screen_signal_connected = False
@@ -710,6 +776,17 @@ class ChatWidget(QWidget):
         title.setObjectName("Title")
         hl.addWidget(title)
         hl.addStretch()
+        # Context switcher — hidden until the user picks a mode from the welcome
+        # chooser; then it lives here so they can switch mid-conversation.
+        self.mode_combo = QComboBox()
+        self.mode_combo.setObjectName("ModeCombo")
+        self.mode_combo.setCursor(Qt.PointingHandCursor)
+        self.mode_combo.setFixedHeight(24)
+        for m in _MODES:
+            self.mode_combo.addItem(m["label"], m["key"])
+        self.mode_combo.setVisible(False)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        hl.addWidget(self.mode_combo)
         # Live LLM provider switch (Azure cloud ↔ local Ollama).
         self.model_btn = QPushButton()
         self.model_btn.setObjectName("ModelBtn")
@@ -826,6 +903,36 @@ class ChatWidget(QWidget):
         }
         #ModelBtn:hover {
             background-color: rgba(255, 255, 255, 80);
+        }
+        #ModeCombo {
+            background-color: rgba(255, 255, 255, 45);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            padding: 0 6px 0 10px;
+            margin-right: 6px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        #ModeCombo:hover {
+            background-color: rgba(255, 255, 255, 80);
+        }
+        #ModeCombo::drop-down {
+            border: none;
+            width: 18px;
+        }
+        #ModeCombo QAbstractItemView {
+            border: 1px solid #bfe3d8;
+            background: #ffffff;
+            color: #16312b;
+            selection-background-color: #00a386;
+            selection-color: #ffffff;
+            outline: none;
+        }
+        #ModeCombo QAbstractItemView::item {
+            min-height: 24px;
+            padding: 4px 8px;
+            color: #16312b;
         }
         QScrollArea#Scroll {
             background-color: #f2faf7;
@@ -1101,7 +1208,7 @@ class ChatWidget(QWidget):
         col.addWidget(title)
 
         subtitle = QLabel(
-            "Your Qubiqon HR assistant.\nAsk me anything, or tap a topic below."
+            "Your Qubiqon assistant.\nPick what I can help with to get started."
         )
         subtitle.setObjectName("WelcomeSubtitle")
         subtitle.setAlignment(Qt.AlignHCenter)
@@ -1129,6 +1236,20 @@ class ChatWidget(QWidget):
             flow.addWidget(btn)
         return wrapper
 
+    def _build_mode_chooser(self) -> QWidget:
+        """The welcome context chooser: one pill per `_MODES` entry. Clicking a
+        pill picks that mode and moves the control to the header dropdown."""
+        wrapper = QWidget()
+        flow = FlowLayout(wrapper, spacing=6)
+        for m in _MODES:
+            btn = QPushButton(m["label"])
+            btn.setObjectName("Chip")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+            btn.clicked.connect(lambda _=False, k=m["key"]: self._select_mode(k))
+            flow.addWidget(btn)
+        return wrapper
+
     def _show_welcome(self) -> None:
         if not self.sections:
             self._add_bot_message(
@@ -1137,10 +1258,10 @@ class ChatWidget(QWidget):
             )
             return
         # Full-width centered hero (the hero centers its own contents), then the
-        # starter chips below it.
+        # context chooser below it (replaces the old FAQ starter chips).
         self._insert_full_width(self._build_welcome_hero())
-        self._starter_chips = self._chip_row(_STARTER_CHIPS)
-        self._insert_row(self._starter_chips, align_right=False)
+        self._mode_chooser = self._build_mode_chooser()
+        self._insert_row(self._mode_chooser, align_right=False)
 
     def _remove_chip_rows(self) -> None:
         """Drop any live suggestion chips before the next turn so stale prompts
@@ -1173,6 +1294,57 @@ class ChatWidget(QWidget):
             f"Now answering with **{info['label']}** (`{info['model']}`)."
         ).finalize()
 
+    # --- Context mode -------------------------------------------------------
+    def _set_mode(self, key: str) -> None:
+        """Remember the chosen context and reflect it in the input placeholder."""
+        self._mode = key
+        self.input.setPlaceholderText(_MODE_BY_KEY[key]["placeholder"])
+        self._warm_mode(key)
+
+    def _warm_mode(self, key: str) -> None:
+        """Background-wake an app mode's backend so the first query isn't a cold
+        start. No-op for RAG modes, when no system is configured, or while a warm
+        is already in flight."""
+        mode = _MODE_BY_KEY[key]
+        tool = mode.get("warm_tool")
+        if not tool or not gateway.is_available():
+            return
+        if self._warmup_worker is not None and self._warmup_worker.isRunning():
+            return
+        self._warmup_worker = _WarmupWorker(tool, dict(mode.get("warm_args") or {}))
+        self._warmup_worker.start()
+
+    def _sync_mode_combo(self) -> None:
+        """Point the header dropdown at the current mode without re-firing the
+        change signal (which would re-enter `_set_mode`)."""
+        idx = self.mode_combo.findData(self._mode)
+        if idx >= 0 and idx != self.mode_combo.currentIndex():
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentIndex(idx)
+            self.mode_combo.blockSignals(False)
+
+    def _reveal_mode_combo(self) -> None:
+        """Dismiss the welcome chooser (if still up) and show the header dropdown
+        so the user can switch context mid-conversation."""
+        if self._mode_chooser is not None:
+            wrapper = self._mode_chooser.parent()  # the row wrapper from _insert_row
+            (wrapper or self._mode_chooser).deleteLater()
+            self._mode_chooser = None
+        self._sync_mode_combo()
+        self.mode_combo.setVisible(True)
+
+    def _select_mode(self, key: str) -> None:
+        """Welcome chooser pill clicked: pick the mode and move the control to
+        the header dropdown."""
+        self._set_mode(key)
+        self._reveal_mode_combo()
+        self.input.setFocus()
+
+    def _on_mode_changed(self, idx: int) -> None:
+        key = self.mode_combo.itemData(idx)
+        if key:
+            self._set_mode(key)
+
     def _clear_chat(self) -> None:
         # Ignore while a reply or leave automation is in flight, to avoid
         # deleting a live bubble or an open confirmation card.
@@ -1185,6 +1357,11 @@ class ChatWidget(QWidget):
         self._last_sections = []
         self._starter_chips = None
         self._followup_chips = None
+        self._mode_chooser = None
+        # Back to the default context, with the chooser (not the dropdown) shown.
+        self._set_mode(_DEFAULT_MODE)
+        self._sync_mode_combo()
+        self.mode_combo.setVisible(False)
         # Remove every row except the trailing stretch (last item, no widget).
         while self.messages_layout.count() > 1:
             item = self.messages_layout.takeAt(0)
@@ -1314,6 +1491,9 @@ class ChatWidget(QWidget):
 
         # Any pending suggestion chips belong to the previous turn — clear them.
         self._remove_chip_rows()
+        # Sending anything commits to a context: dismiss the welcome chooser (if
+        # still up) and surface the header dropdown at the current/default mode.
+        self._reveal_mode_combo()
         self._add_user_message(text)
 
         intent = classify_intent(text)
@@ -1323,7 +1503,17 @@ class ChatWidget(QWidget):
             self._add_bot_message(self._canned_reply(intent))
             return
 
-        sections, confident = self._sections_for(text, followup)
+        # The selected context decides everything (no AI/keyword routing): HR
+        # Policy = pure RAG with Source + chips; an app mode = its MCP tools only.
+        mode = _MODE_BY_KEY[self._mode]
+        if mode["rag"]:
+            sections, confident = self._sections_for(text, followup)
+            systems_override: list[str] = []
+        else:
+            sections, confident = [], False
+            systems_override = list(mode["systems"])
+        self._pending_is_app_mode = not mode["rag"]
+
         self._current_bot_bubble = self._add_bot_message("")
         self._current_bot_bubble.start_thinking()
 
@@ -1341,7 +1531,7 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(False)
         self._worker = LlmWorker(
             text, sections, self.model, list(self._history), self._contacts,
-            max_tokens, self.provider,
+            max_tokens, self.provider, systems_override,
         )
         self._worker.chunk_received.connect(self._on_chunk)
         self._worker.finished_ok.connect(self._on_done)
@@ -1354,9 +1544,15 @@ class ChatWidget(QWidget):
             self._scroll_to_bottom()
 
     def _on_done(self) -> None:
+        # An app-mode turn (e.g. Finance) is not a grounded policy answer: drop
+        # the policy-only Source line and follow-up chips.
+        app_mode = self._pending_is_app_mode
         answer = ""
         if self._current_bot_bubble is not None:
             answer = self._current_bot_bubble.text().strip()
+            if app_mode and answer:
+                answer = _strip_source_line(answer)
+                self._current_bot_bubble.set_text(answer)
             if not answer:
                 self._current_bot_bubble.set_text("(no response)")
             else:
@@ -1367,11 +1563,12 @@ class ChatWidget(QWidget):
             self._history.append({"role": "user", "content": self._pending_user_msg})
             self._history.append({"role": "assistant", "content": answer})
             self._trim_history()
-        # Offer quick follow-ups on a grounded answer.
-        if answer and self._pending_has_context:
+        # Offer quick follow-ups on a grounded policy answer (never in an app mode).
+        if answer and self._pending_has_context and not app_mode:
             chips = self._followup_chips_for(self._last_sections)
             self._followup_chips = self._chip_row(chips, followup=True)
             self._insert_row(self._followup_chips, align_right=False)
+        self._pending_is_app_mode = False
         self._pending_user_msg = None
         self._pending_has_context = False
         self.send_btn.setEnabled(True)
@@ -1420,6 +1617,7 @@ class ChatWidget(QWidget):
             )
             # Keep the technical detail handy for debugging without showing it.
             self._current_bot_bubble.setToolTip(err)
+        self._pending_is_app_mode = False
         self._pending_user_msg = None
         self._pending_has_context = False
         self.send_btn.setEnabled(True)

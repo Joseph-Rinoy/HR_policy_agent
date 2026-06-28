@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 try:
     from dotenv import load_dotenv
@@ -46,6 +47,13 @@ SERVERS: dict[str, str] = {
 
 # Discovered tool lists, cached per system per process (tool sets are static).
 _tools_cache: dict[str, list[dict]] = {}
+
+# A finance MCP server (and its on-behalf-of backend) can cold-start: the first
+# hit after idle errors, a retry seconds later succeeds. Since every tool today
+# is read-only (idempotent — the gateway write-gate guarantees this), we retry a
+# failed call a few times with a short backoff so the first query "just works".
+_MAX_ATTEMPTS = 5  # delays 2s,4s,6s,8s between tries → ~20s to ride out a cold start
+_RETRY_BACKOFF_S = 2.0
 
 
 class McpError(RuntimeError):
@@ -83,6 +91,25 @@ def _run(coro):
         raise
     except Exception as exc:  # connection refused, auth rejected, protocol error…
         raise McpError(str(exc)) from exc
+
+
+def _run_with_retry(make_coro):
+    """Run an MCP coroutine, retrying transient failures (e.g. server cold start).
+
+    ``make_coro`` is a thunk that builds a *fresh* coroutine each attempt (a
+    coroutine can only be awaited once). Safe for the read-only tools we expose
+    today; do not use for state-changing calls without idempotency guarantees.
+    """
+    last: McpError | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            return _run(make_coro())
+        except McpError as exc:
+            last = exc
+            if attempt + 1 < _MAX_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF_S * (attempt + 1))
+    assert last is not None
+    raise last
 
 
 async def _list_tools(url: str, token: str) -> list[dict]:
@@ -124,7 +151,7 @@ def list_tools(system: str, token: str, *, refresh: bool = False) -> list[dict]:
     if not url:
         raise McpError(f"No MCP server configured for system '{system}'.")
     if refresh or system not in _tools_cache:
-        _tools_cache[system] = _run(_list_tools(url, token))
+        _tools_cache[system] = _run_with_retry(lambda: _list_tools(url, token))
     return _tools_cache[system]
 
 
@@ -133,4 +160,4 @@ def call_tool(system: str, token: str, name: str, args: dict) -> str:
     url = server_url(system)
     if not url:
         raise McpError(f"No MCP server configured for system '{system}'.")
-    return _run(_call_tool(url, token, name, args))
+    return _run_with_retry(lambda: _call_tool(url, token, name, args))
