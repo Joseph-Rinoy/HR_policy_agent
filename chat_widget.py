@@ -61,7 +61,7 @@ from llm import (
     PROVIDERS,
     build_user_message,
     model_for,
-    stream_answer,
+    stream_agent_answer,
 )
 from paths import app_base_dir
 from policy_loader import PolicySection, load_contacts, load_policies
@@ -351,7 +351,9 @@ class LlmWorker(QThread):
 
     def run(self) -> None:
         try:
-            for chunk in stream_answer(
+            # Agent path: HR policy RAG plus live Finance tools over MCP. Falls
+            # back to plain RAG when Entra sign-in / the MCP server aren't set up.
+            for chunk in stream_agent_answer(
                 self.question,
                 self.sections,
                 self.model,

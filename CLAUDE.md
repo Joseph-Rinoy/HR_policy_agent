@@ -36,7 +36,15 @@ after a demo and set a low Azure spending cap.
 |---|---|
 | `app.py` | Entry point. Creates `ChatLauncher` (floating button) + `ChatWidget`; click toggles the chat. Frameless always-on-top tool windows. |
 | `chat_widget.py` | All UI: `ChatLauncher` (logo button), `ChatWidget` (chat window), `MessageBubble`, `LlmWorker` (QThread streaming), `FlowLayout` (wrapping chip rows). Theme constants + stylesheet live here. |
-| `llm.py` | Azure OpenAI client + streaming `stream_answer()`, the `SYSTEM_PROMPT`, and `build_user_message()` (builds the CONTEXT block). |
+| `llm.py` | HR-policy prompts (`SYSTEM_PROMPT`/`AGENT_SYSTEM_PROMPT`) + `build_user_message()` (CONTEXT block); thin `stream_answer()` / `stream_agent_answer()` that delegate to `orchestrator`. Re-exports Azure/provider config from `llm_adapter` for back-compat. **Vendor-neutral.** |
+| `llm_adapter.py` | **The only vendor-coupled layer.** OpenAI/Azure (+Ollama) SDK, provider registry/config, and the neutral `ToolSpec`/`ToolCall` abstractions. Swap LLM vendor = new adapter here only. |
+| `orchestrator.py` | Vendor-neutral conversation + tool-call loop on abstract `ToolCall`s; asks `routing` which systems a query touches, `gateway` for their tools, streams the final answer. |
+| `routing.py` | `route_systems()` — keyword classifier → which internal system(s) a query needs (empty ⇒ pure-RAG turn; no Entra sign-in). |
+| `gateway.py` | Single MCP chokepoint: per-call token mint (via `identity`), audit, allow-list, `system.tool` namespacing, write-gate, untrusted-output framing. Thin (routing+policy only). |
+| `identity.py` | `mint_downstream_token(system)` seam — per-system Entra scope map; quarantines the IdP. Per-user delegated token, no service account. |
+| `auth_entra.py` | The only MSAL/Entra code, behind `identity`. `get_entra_token(scope)`; interactive+silent; cache in `.msal_token_cache.json`. |
+| `mcp_client.py` | Per-system MCP transport (Streamable HTTP). `SERVERS` registry; `list_tools()`/`call_tool()` return neutral data. |
+| `audit.py` | `log_tool_call()` — one JSONL record per tool call (reads included) to `logs/audit.jsonl`. |
 | `policy_loader.py` | `load_policies()` → list of `PolicySection`; parses `policies/*.md` by headings, attaches SharePoint `url` from `policy_links.json`. `load_contacts()` reads `hr_contact`/`posh_contact` from the handbook frontmatter. |
 | `retriever.py` | `retrieve_scored()` — keyword scoring with light stemming + synonym expansion, returning each section with its score. No embeddings. |
 | `intent.py` | `classify_intent()` → `greeting` / `thanks` / `farewell` / `ack` / `meta` / `apply_leave` / `policy`. Small-talk + `apply_leave` get canned replies (no LLM call). `apply_leave` fires only on imperative *filing* requests, not leave *questions* (`_LEAVE_QUESTION_RE` guard). |
@@ -50,8 +58,12 @@ after a demo and set a low Azure spending cap.
 ### Request flow
 `_on_send` → `_submit` → `classify_intent` (canned reply for small-talk /
 `apply_leave`) → `retrieve_scored()` top sections → `LlmWorker` streams
-`stream_answer()` → chunks append to the bot `MessageBubble` → on completion
-`finalize()` renders HTML.
+`stream_agent_answer()` → `orchestrator`: `routing.route_systems()` picks systems
+→ `gateway.list_tools()` (namespaced, policy-checked) → adapter tool-call rounds,
+each call via `gateway.call_tool()` (token mint + audit + untrusted framing) →
+adapter streams the final answer → chunks append to the bot `MessageBubble` → on
+completion `finalize()` renders HTML. No system matched ⇒ pure-RAG turn (no tools,
+no Entra sign-in). See `docs/Architecture_Layers.md`.
 
 ### Leave application (button-only)
 Filing leave is triggered **only** by the header **🗓** button (`leave_btn` →

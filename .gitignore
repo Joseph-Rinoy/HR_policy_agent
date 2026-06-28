@@ -1,6 +1,9 @@
 # Secrets / config — never commit
 .env
 credentials.py
+# Entra/MSAL token cache (contains refresh tokens) and the audit trail
+.msal_token_cache.json
+logs/
 
 # Virtual environment
 venv/
