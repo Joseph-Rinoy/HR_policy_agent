@@ -99,8 +99,13 @@ def list_tools(systems: list[str], *, user: str | None = None) -> list[ToolSpec]
         try:
             token = identity.mint_downstream_token(system, user=user)
             raw = mcp_client.list_tools(system, token)
-        except Exception:
-            continue  # this system is unavailable this turn; degrade gracefully
+        except Exception as exc:
+            # This system is unavailable this turn; degrade gracefully. Audit the
+            # discovery failure so it isn't silently invisible — otherwise a turn
+            # that should have used tools just looks like the model declined to.
+            log_tool_call(user=user, system=system, tool="(list_tools)", args=None,
+                          status="error", error=str(exc))
+            continue
         for t in raw:
             bare = t["name"]
             if _is_write(bare) and _namespaced(system, bare) not in _WRITE_ALLOWLIST:

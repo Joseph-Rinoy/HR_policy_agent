@@ -66,7 +66,6 @@ from llm import (
 from paths import app_base_dir
 from policy_loader import PolicySection, load_contacts, load_policies
 from retriever import retrieve_scored
-import gateway
 
 
 LOGO_FILENAME = "Qubi.png"
@@ -243,10 +242,6 @@ _MODES = [
         "systems": ["finance"],
         "rag": False,
         "placeholder": "Ask about your expenses, advances, invoices...",
-        # Cheap read fired in the background when this mode is picked, to wake the
-        # (cold-starting) finance backend before the user's first real question.
-        "warm_tool": "finance.list_my_expenses",
-        "warm_args": {"page": 1, "pageSize": 1},
     },
 ]
 _MODE_BY_KEY = {m["key"]: m for m in _MODES}
@@ -306,50 +301,89 @@ def _topic_label(heading: str) -> str:
     return label.strip()
 
 
-# Small-talk replies: a pool per intent so Qubi varies its responses instead of
-# repeating one line. A reply is picked at random (avoiding the immediate repeat).
+# Small-talk replies, per context mode: a pool per intent so Qubi varies its
+# responses instead of repeating one line (a reply is picked at random, avoiding
+# the immediate repeat). The "policy" pool is the default; a mode overrides only
+# the intents it cares about — anything missing falls back to "policy".
 _CANNED_REPLIES = {
-    "greeting": [
-        "Hi there, I'm Qubi 👋 — happy to help. Ask me anything about Qubiqon's HR policies.",
-        "Hello! Qubi here. What HR policy can I help you with today?",
-        "Hey! 😊 Ask me about leave, WFH, travel, conduct — anything HR.",
-        "Hi! Good to see you. What would you like to know about Qubiqon's policies?",
-    ],
-    "thanks": [
-        "You're very welcome! 😊 Anything else I can help with?",
-        "Happy to help! Let me know if there's anything else.",
-        "Anytime! I'm here whenever you have a policy question.",
-        "My pleasure! Feel free to ask me anything else.",
-    ],
-    "farewell": [
-        "Take care! 👋 Come back anytime you need an HR answer.",
-        "Bye for now! I'm here whenever you need me.",
-        "See you later! Reach out anytime with a policy question.",
-        "Have a great day! 😊 I'll be right here if anything comes up.",
-    ],
-    "ack": [
-        "👍 Anything else I can help you with?",
-        "Got it! Let me know if you have another question.",
-        "Sure thing! What else would you like to know?",
-        "Glad that helps! Ask me anything else, anytime.",
-    ],
-    "meta": [
-        "I'm Qubi, your friendly Qubiqon HR helper. Ask me about leave, benefits, "
-        "attendance, working hours, conduct, reimbursements — any company HR policy.",
-        "I'm Qubi 😊 — I can help with leave, WFH, travel, conduct, reimbursements, "
-        "and all things Qubiqon HR. What would you like to know?",
-        "Think of me as your HR buddy at Qubiqon. I answer questions about company "
-        "policies — leave, attendance, benefits, and more. Just ask!",
-    ],
-    "apply_leave": [
-        "Happy to help you apply! Just tap the 🗓 button at the top and I'll open "
-        "the leave form for you.",
-        "To file a leave request, tap the 🗓 Apply-for-leave button up top — I'll "
-        "pull up the form right away.",
-        "Sure! Hit the 🗓 button in the top bar and I'll open the leave form for you "
-        "to fill in.",
-    ],
+    "policy": {
+        "greeting": [
+            "Hi there, I'm Qubi 👋 — happy to help. Ask me anything about Qubiqon's HR policies.",
+            "Hello! Qubi here. What HR policy can I help you with today?",
+            "Hey! 😊 Ask me about leave, WFH, travel, conduct — anything HR.",
+            "Hi! Good to see you. What would you like to know about Qubiqon's policies?",
+        ],
+        "thanks": [
+            "You're very welcome! 😊 Anything else I can help with?",
+            "Happy to help! Let me know if there's anything else.",
+            "Anytime! I'm here whenever you have a policy question.",
+            "My pleasure! Feel free to ask me anything else.",
+        ],
+        "farewell": [
+            "Take care! 👋 Come back anytime you need an HR answer.",
+            "Bye for now! I'm here whenever you need me.",
+            "See you later! Reach out anytime with a policy question.",
+            "Have a great day! 😊 I'll be right here if anything comes up.",
+        ],
+        "ack": [
+            "👍 Anything else I can help you with?",
+            "Got it! Let me know if you have another question.",
+            "Sure thing! What else would you like to know?",
+            "Glad that helps! Ask me anything else, anytime.",
+        ],
+        "meta": [
+            "I'm Qubi, your friendly Qubiqon HR helper. Ask me about leave, benefits, "
+            "attendance, working hours, conduct, reimbursements — any company HR policy.",
+            "I'm Qubi 😊 — I can help with leave, WFH, travel, conduct, reimbursements, "
+            "and all things Qubiqon HR. What would you like to know?",
+            "Think of me as your HR buddy at Qubiqon. I answer questions about company "
+            "policies — leave, attendance, benefits, and more. Just ask!",
+        ],
+        "apply_leave": [
+            "Happy to help you apply! Just tap the 🗓 button at the top and I'll open "
+            "the leave form for you.",
+            "To file a leave request, tap the 🗓 Apply-for-leave button up top — I'll "
+            "pull up the form right away.",
+            "Sure! Hit the 🗓 button in the top bar and I'll open the leave form for you "
+            "to fill in.",
+        ],
+    },
+    "finance": {
+        "greeting": [
+            "Hi there, I'm Qubi 👋 — ask me about your expenses, advances, invoices and more.",
+            "Hello! Qubi here. What finance data can I pull up for you?",
+            "Hey! 😊 Ask me about your expenses, advances, bills or dashboard summary.",
+            "Hi! Good to see you. What would you like to check in Finance?",
+        ],
+        "thanks": [
+            "You're very welcome! 😊 Anything else from Finance I can pull up?",
+            "Happy to help! Let me know if there's another figure you need.",
+            "Anytime! I'm here whenever you have a finance question.",
+            "My pleasure! Feel free to ask me about anything else in Finance.",
+        ],
+        "farewell": [
+            "Take care! 👋 Come back anytime you need a finance lookup.",
+            "Bye for now! I'm here whenever you need your finance data.",
+            "See you later! Reach out anytime with a finance question.",
+            "Have a great day! 😊 I'll be right here if anything comes up.",
+        ],
+        "ack": [
+            "👍 Anything else I can pull up for you?",
+            "Got it! Let me know if you have another finance question.",
+            "Sure thing! What else would you like to check?",
+            "Glad that helps! Ask me anything else, anytime.",
+        ],
+        "meta": [
+            "I'm Qubi 😊 — in Finance I can look up your expenses, advances, vendor "
+            "bills, client invoices, vendors, clients and a dashboard summary. What "
+            "would you like to see?",
+            "Think of me as your finance buddy at Qubiqon. Ask me about your expenses, "
+            "advances, invoices, bills or a quick dashboard summary.",
+        ],
+    },
 }
+# Intents that get a canned (no-LLM) reply — independent of the active mode.
+_CANNED_INTENTS = set(_CANNED_REPLIES["policy"])
 
 
 class LlmWorker(QThread):
@@ -367,6 +401,7 @@ class LlmWorker(QThread):
         max_tokens: int = 400,
         provider: str | None = None,
         systems: list[str] | None = None,
+        app_mode: str | None = None,
     ):
         super().__init__()
         self.question = question
@@ -378,6 +413,8 @@ class LlmWorker(QThread):
         self.provider = provider
         # Optional routing override (None ⇒ orchestrator routes from the question).
         self.systems = systems
+        # Assistant persona for this turn ("finance" ⇒ Finance prompts; None ⇒ HR).
+        self.app_mode = app_mode
         # Set True once the answer was produced via a system tool (not pure RAG),
         # so the UI can drop the policy-only Source line / follow-up chips.
         self.tools_used = False
@@ -397,33 +434,13 @@ class LlmWorker(QThread):
                 self.provider,
                 tool_stats=tool_stats,
                 systems=self.systems,
+                app_mode=self.app_mode,
             ):
                 self.chunk_received.emit(chunk)
             self.tools_used = bool(tool_stats.get("tools_used"))
             self.finished_ok.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
-
-
-class _WarmupWorker(QThread):
-    """Wakes a system's MCP backend in the background (cold-start mitigation).
-
-    Fires one cheap read when an app mode is selected so the user's first real
-    question hits a warm server instead of the cold-start error. The result is
-    discarded and all errors are swallowed — this is best-effort warming only.
-    """
-
-    def __init__(self, tool: str, args: dict, user: str | None = None):
-        super().__init__()
-        self.tool = tool
-        self.args = args
-        self.user = user
-
-    def run(self) -> None:
-        try:
-            gateway.call_tool(self.tool, self.args, user=self.user)
-        except Exception:
-            pass  # warming is best-effort; the real query will retry if needed
 
 
 class LeaveWorker(QThread):
@@ -748,7 +765,6 @@ class ChatWidget(QWidget):
         self._starter_chips: QWidget | None = None
         self._followup_chips: QWidget | None = None
         self._leave_worker: LeaveWorker | None = None
-        self._warmup_worker: _WarmupWorker | None = None
         self._active_card: ConfirmationCard | None = None
         self._pending_leave_bubble: MessageBubble | None = None
         self._screen_signal_connected = False
@@ -1299,20 +1315,6 @@ class ChatWidget(QWidget):
         """Remember the chosen context and reflect it in the input placeholder."""
         self._mode = key
         self.input.setPlaceholderText(_MODE_BY_KEY[key]["placeholder"])
-        self._warm_mode(key)
-
-    def _warm_mode(self, key: str) -> None:
-        """Background-wake an app mode's backend so the first query isn't a cold
-        start. No-op for RAG modes, when no system is configured, or while a warm
-        is already in flight."""
-        mode = _MODE_BY_KEY[key]
-        tool = mode.get("warm_tool")
-        if not tool or not gateway.is_available():
-            return
-        if self._warmup_worker is not None and self._warmup_worker.isRunning():
-            return
-        self._warmup_worker = _WarmupWorker(tool, dict(mode.get("warm_args") or {}))
-        self._warmup_worker.start()
 
     def _sync_mode_combo(self) -> None:
         """Point the header dropdown at the current mode without re-firing the
@@ -1469,8 +1471,11 @@ class ChatWidget(QWidget):
         return [s for s, _ in scored], False
 
     def _canned_reply(self, intent: str) -> str:
-        """Pick a small-talk reply at random, avoiding the one we just used."""
-        pool = _CANNED_REPLIES[intent]
+        """Pick a small-talk reply at random, avoiding the one we just used.
+        Replies are picked from the active context's pool, falling back to the
+        policy pool for any intent that mode doesn't override."""
+        pools = _CANNED_REPLIES.get(self._mode, _CANNED_REPLIES["policy"])
+        pool = pools.get(intent) or _CANNED_REPLIES["policy"][intent]
         choices = [r for r in pool if r != self._last_canned] or pool
         reply = random.choice(choices)
         self._last_canned = reply
@@ -1499,7 +1504,7 @@ class ChatWidget(QWidget):
         intent = classify_intent(text)
         # Filing leave is button-only now; a typed leave request just nudges the
         # user to the header 🗓 button (handled via the "apply_leave" reply pool).
-        if intent in _CANNED_REPLIES:
+        if intent in _CANNED_INTENTS:
             self._add_bot_message(self._canned_reply(intent))
             return
 
@@ -1509,9 +1514,11 @@ class ChatWidget(QWidget):
         if mode["rag"]:
             sections, confident = self._sections_for(text, followup)
             systems_override: list[str] = []
+            app_mode: str | None = None
         else:
             sections, confident = [], False
             systems_override = list(mode["systems"])
+            app_mode = self._mode
         self._pending_is_app_mode = not mode["rag"]
 
         self._current_bot_bubble = self._add_bot_message("")
@@ -1531,7 +1538,7 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(False)
         self._worker = LlmWorker(
             text, sections, self.model, list(self._history), self._contacts,
-            max_tokens, self.provider, systems_override,
+            max_tokens, self.provider, systems_override, app_mode,
         )
         self._worker.chunk_received.connect(self._on_chunk)
         self._worker.finished_ok.connect(self._on_done)
