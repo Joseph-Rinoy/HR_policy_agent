@@ -35,10 +35,10 @@ NAMESPACE_SEP = "."
 _ENABLED_SYSTEMS: set[str] = {"finance"}
 
 # Write gating: tools the gateway classifies as state-changing are blocked
-# unless their namespaced name is allow-listed here. Everything is read-only
-# today, so this stays empty — the separation exists from the start so writes
-# can be governed (allow-list by role, confirmation, dry-run) when they arrive.
-_WRITE_ALLOWLIST: set[str] = set()
+# unless their namespaced name is allow-listed here. Add a namespaced tool name
+# to permit exactly that one write; everything else state-changing stays gated,
+# so writes are governed (allow-list by role, confirmation, dry-run) one at a time.
+_WRITE_ALLOWLIST: set[str] = {"finance.create_advance", "finance.create_forecast", "finance.create_expense"}
 
 # Heuristic verbs that mark a tool as state-changing. Used only to *flag and
 # gate* — never to enable. A finance server that later exposes e.g.
