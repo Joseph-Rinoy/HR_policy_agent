@@ -64,6 +64,20 @@ foreach ($gif in @("Qubi_launcher.gif", "typing.gif")) {
     }
 }
 
+# 3b. Bundle the Playwright Chromium browser next to the exe. PyInstaller ships
+#     the Playwright driver but NOT the browser binaries, so a clean machine has
+#     no Chromium to launch. Install it straight into dist\...\ms-playwright,
+#     which the app points PLAYWRIGHT_BROWSERS_PATH at (see leave_automation.py).
+$browsers = Join-Path $dist "ms-playwright"
+if (Test-Path $browsers) { Remove-Item -Recurse -Force $browsers }
+$env:PLAYWRIGHT_BROWSERS_PATH = $browsers
+try {
+    & $py -m playwright install chromium
+    if ($LASTEXITCODE -ne 0) { throw "playwright install chromium failed (exit $LASTEXITCODE)." }
+} finally {
+    Remove-Item Env:\PLAYWRIGHT_BROWSERS_PATH
+}
+
 # 4. Zip the folder for delivery.
 $zip = "$name.zip"
 if (Test-Path $zip) { Remove-Item $zip }

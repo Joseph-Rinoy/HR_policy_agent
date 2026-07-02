@@ -729,7 +729,7 @@ class ChatWidget(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(WIDGET_WIDTH, WIDGET_HEIGHT)
         self.setMinimumSize(WIDGET_WIDTH, WIDGET_HEIGHT)  # never collapse on DPI change
-        self.setWindowTitle("Qubi - Policy Assistant")
+        self.setWindowTitle("Qubi - Qubiqon Assistant")
 
         # Active LLM provider ("azure"/"ollama") and its model name. Switchable
         # live from the header; the model tracks the provider's configured model.
@@ -788,7 +788,7 @@ class ChatWidget(QWidget):
         header.setFixedHeight(46)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(14, 0, 8, 0)
-        title = QLabel("Qubi - Policy Assistant")
+        title = QLabel("Qubi - Qubiqon Assistant")
         title.setObjectName("Title")
         hl.addWidget(title)
         hl.addStretch()
@@ -1740,7 +1740,7 @@ class ChatLauncher(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedSize(self.SIZE, self.SIZE)
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("Qubi - Policy Assistant")
+        self.setToolTip("Qubi - Qubiqon Assistant")
         self._hover = False
         self._pressed = False
         self._drag_origin: QPoint | None = None
